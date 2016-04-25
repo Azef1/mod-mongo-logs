@@ -36,7 +36,9 @@ import re
 import sys
 import pymongo
 import traceback
+import hashlib
 
+from elasticsearch import Elasticsearch
 from shinken.objects.service import Service
 from shinken.modulesctx import modulesctx
 
@@ -477,6 +479,7 @@ class MongoLogs(BaseModule):
         # Cache index ...
         query = """%s/%s_%s""" % (hostname, service, day)
         q_day = { "hostname": hostname, "service": service, "day": day.strftime('%Y-%m-%d') }
+        q_day_es = { "hostname": hostname.encode('ascii'), "service": service.encode('ascii'), "day": day.strftime('%Y-%m-%d') }
         q_yesterday = { "hostname": hostname, "service": service, "day": yesterday.strftime('%Y-%m-%d') }
 
         # Test if record for current day still exists
@@ -559,13 +562,43 @@ class MongoLogs(BaseModule):
         data['last_check_timestamp'] = int(b.data['last_chk'])
 
         self.availability_cache[query] = data
+       
+        #Encode data for ElasticSearch 
+        data['day'] = data['day'].encode('ascii')
+        data['@timestamp'] = str(datetime.datetime.utcfromtimestamp(int(data['day_ts'])).isoformat()+'Z').encode('ascii')
+        data['is_downtime'] =  data['is_downtime'].encode('ascii')
+        data['service'] = data['service'].encode('ascii')
+        data['hostname'] = data['hostname'].encode('ascii')
+        data['sla_duration'] = 86400 - data['daily_2']
+        data['sla_percentage'] = float(data['sla_duration'])/float(86400)
+        data['sla_percentage_invert'] = 1 - (float(data['sla_duration'])/float(86400))
+
+        try:  
+            del data['_id']
+        except KeyError:
+            pass
+ 
+        data_es = {key.encode("ascii"): value for (key, value) in data.items()}
+                
 
         # Store cached values ...
         try:
             logger.debug("[mongo-logs] store for: %s", self.availability_cache[query])
             # self.db[self.hav_collection].save(self.availability_cache[query])
             self.db[self.hav_collection].replace_one(q_day, self.availability_cache[query], upsert=True)
-        except AutoReconnect, exp:
+            
+            
+            #Part to send availability logs to ElasticSearch
+            es = Elasticsearch()
+            # Create index name
+            d = datetime.date.today()
+            index_name = 'shinken_availability-' + d.strftime('%Y.%m.%d'))
+	    # Create unique id   
+            str1 = str(q_day_es)
+            encoded = hashlib.md5(str1).hexdigest()
+            # Send data to ElasticSearch            
+            es.index(index=index_name, doc_type="shinken-logs", id=encoded, body=data_es)
+	except AutoReconnect, exp:
             logger.error("[mongo-logs] Autoreconnect exception when updating availability: %s", str(exp))
             self.is_connected = SWITCHING
             # Abort update ... no backlog management currently!
